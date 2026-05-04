@@ -27,6 +27,79 @@ use Digest::MD5 ();
 use Digest::SHA ();
 
 our $debug;
+our $osc_credentials_loaded;
+our @osc_credentials;
+
+sub load_osc_credentials {
+  return if $osc_credentials_loaded;
+  $osc_credentials_loaded = 1;
+
+  my @files;
+  push @files, $ENV{'OSC_CONFIG'} if $ENV{'OSC_CONFIG'};
+  push @files, "$ENV{'HOME'}/.config/osc/oscrc" if $ENV{'HOME'};
+  push @files, "$ENV{'HOME'}/.oscrc" if $ENV{'HOME'};
+
+  my %seen;
+  for my $file (@files) {
+    next unless $file && !$seen{$file}++ && -r $file;
+    my ($section, %data);
+    my $save = sub {
+      return unless $section && $section =~ /^https?:\/\//;
+      return unless defined($data{'user'}) && defined($data{'pass'});
+      push @osc_credentials, { url => $section, user => $data{'user'}, pass => $data{'pass'} };
+    };
+    my $fd;
+    next unless open($fd, '<', $file);
+    while (<$fd>) {
+      chomp;
+      s/\r$//;
+      s/^\s+//;
+      s/\s+$//;
+      next if $_ eq '' || /^#/ || /^;/;
+      if (/^\[(.*)\]$/) {
+	$save->();
+	$section = $1;
+	%data = ();
+	next;
+      }
+      next unless /^([^=]+?)\s*=\s*(.*)$/;
+      my ($key, $value) = ($1, $2);
+      $key =~ s/\s+$//;
+      $value =~ s/^['"]//;
+      $value =~ s/['"]$//;
+      $data{$key} = $value if $key eq 'user' || $key eq 'pass';
+    }
+    $save->();
+    close($fd);
+  }
+}
+
+sub add_osc_auth_headers {
+  my ($url, @hdrs) = @_;
+
+  for (my $i = 0; $i < @hdrs - 1; $i += 2) {
+    return @hdrs if lc($hdrs[$i]) eq 'authorization';
+  }
+
+  load_osc_credentials();
+  my $match;
+  my $matchlen = -1;
+  my $request_url = $url;
+  $request_url =~ s/\/+$//;
+  for my $cred (@osc_credentials) {
+    my $base = $cred->{'url'};
+    $base =~ s/\/+$//;
+    next unless $request_url eq $base || index($request_url, "$base/") == 0;
+    next if length($base) <= $matchlen;
+    $match = $cred;
+    $matchlen = length($base);
+  }
+  return @hdrs unless $match;
+
+  require MIME::Base64;
+  my $auth = MIME::Base64::encode_base64("$match->{'user'}:$match->{'pass'}", "");
+  return ('Authorization' => "Basic $auth", @hdrs);
+}
 
 #
 # Create a user agent used to access remote servers
@@ -74,6 +147,7 @@ sub ua_get {
   my ($ua, $url, $maxsize, @hdrs) = @_;
   my $res;
   print "GET $url\n" if $debug;
+  @hdrs = add_osc_auth_headers($url, @hdrs);
   if (defined($maxsize)) {
     my $oldmaxsize = $ua->max_size($maxsize);
     $res = $ua->get($url, @hdrs);
@@ -88,6 +162,7 @@ sub ua_get {
 sub ua_head {
   my ($ua, $url, $maxsize, @hdrs) = @_;
   print "HEAD $url\n" if $debug;
+  @hdrs = add_osc_auth_headers($url, @hdrs);
   return $ua->head($url, @hdrs);
 }
 
