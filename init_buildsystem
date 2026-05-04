@@ -535,7 +535,6 @@ downloadpkg() {
     SRC=${SRC/%.pkg.tar.?z/.arch}
     local destdir="$cachedir/tmp"
     mkdir -p "$destdir"
-    echo "downloading $url ... ";
     $BUILD_DIR/download "$destdir" "$url" || cleanup_and_exit 1
     local destfile="$destdir/${url##*/}"
     if test ! -e "$destfile" ; then
@@ -553,6 +552,355 @@ downloadpkg() {
 	;;
     esac
     mv "$destfile" "$SRC" || cleanup_and_exit 1
+}
+
+# Merge dynamic BuildRequires into an existing rpmlist.  This is used when a
+# build has already initialized its build system from an rpmlist but a
+# genbuildreqs pass discovers additional dependencies that must be resolved in
+# the same repository context.
+merge_dynamic_buildrequires_into_rpmlist() {
+    local recipe="$1"
+    shift
+
+    test -n "$RPMLIST" || return 0
+    test -n "$recipe" || return 0
+    test "$recipe" != "${recipe%.spec}" || return 0
+    test "$recipe" = "${recipe#--}" || return 0
+    test "$#" != 0 || return 0
+
+    CACHE_FILE=$BUILD_ROOT/.srcfiles.cache
+    create_cache_file_from_rpmlist
+    add_remote_buildinfo_repos_to_cache "$recipe"
+    prefer_python3_dist_providers
+
+    local rpmlist_dynamic="$BUILD_INIT_CACHE/rpmlist.dynamic"
+    local rpmlist_context="$BUILD_INIT_CACHE/rpmlist.context"
+    test -z "$LIST_STATE" && echo "expanding dynamic build dependencies..."
+    awk '$1 !~ /^(preinstall:|vminstall:|runscripts:|dist:|installonly:|noinstall:|rpmid:|preinstallimage:|preinstallimagesource:|preinstallimageinfo:|sysroot:)$/ { print $1 }' "$RPMLIST" > "$rpmlist_context"
+    VMOPT=
+    test -z "$PREPARE_VM" || VMOPT=--vm
+    if ! $BUILD_DIR/expanddeps $USEUSEDFORBUILD $VMOPT "${definesnstuff[@]}" --dist "$BUILD_DIST" --depfile "$CACHE_FILE" --archpath "$BUILD_ARCH" --configdir $CONFIG_DIR $(cat "$rpmlist_context") "$@" > "$rpmlist_dynamic" ; then
+	rm -f $BUILD_IS_RUNNING
+	rm -f "$rpmlist_context"
+	cleanup_and_exit 1
+    fi
+
+    awk '
+      FNR == NR {
+        if ($1 == "rpmid:") {
+          idpkg = $2
+          sub(/:.*/, "", idpkg)
+          dynids[idpkg] = $0
+        } else if ($1 !~ /^(preinstall:|vminstall:|runscripts:|dist:|installonly:|noinstall:)$/) {
+          dynpkgs[$1] = $0
+          dynorder[++dyncount] = $1
+        } else {
+        }
+        next
+      }
+      {
+        if ($1 == "rpmid:") {
+          idpkg = $2
+          sub(/:.*/, "", idpkg)
+          if (idpkg in dynids) {
+            print dynids[idpkg]
+            delete dynids[idpkg]
+          } else {
+            print
+          }
+        } else if ($1 ~ /^(preinstall:|vminstall:|runscripts:|dist:|installonly:|noinstall:)$/) {
+          print
+        } else {
+          print
+          seen[$1] = 1
+          delete dynpkgs[$1]
+        }
+      }
+      END {
+        for (i = 1; i <= dyncount; i++) {
+          pkg = dynorder[i]
+          if ((pkg in dynpkgs) && !(pkg in seen)) {
+            print dynpkgs[pkg]
+            if (pkg in dynids) {
+              print dynids[pkg]
+              delete dynids[pkg]
+            }
+          }
+        }
+      }
+    ' "$rpmlist_dynamic" "$RPMLIST" > "$BUILD_INIT_CACHE/rpmlist.merged"
+    mv "$BUILD_INIT_CACHE/rpmlist.merged" "$RPMLIST"
+    rm -f "$rpmlist_dynamic" "$rpmlist_context"
+}
+
+# If both python-* and python3-* packages provide the same python3dist()
+# capability, prefer the python3-* provider by removing duplicate python3dist
+# provides from the generic python-* package records in the temporary cache.
+prefer_python3_dist_providers() {
+    local cache_file_py3="$BUILD_INIT_CACHE/srcfiles.cache.py3"
+
+    awk '
+      function pkgname(line, name) {
+        name = line
+        sub(/^[A-Za-z]:/, "", name)
+        sub(/\..*/, "", name)
+        return name
+      }
+      function record_py3_caps(line, name, n, i, a, cap) {
+        name = pkgname(line)
+        if (name !~ /^python3-/) {
+          return
+        }
+        sub(/^[^:]*:[^:]*: /, "", line)
+        n = split(line, a, " ")
+        for (i = 1; i <= n; i++) {
+          cap = a[i]
+          if (cap ~ /^python3(\.[0-9]+)?dist\(/) {
+            py3caps[cap] = 1
+          }
+        }
+      }
+      FNR == NR {
+        if ($0 ~ /^P:/) {
+          record_py3_caps($0)
+        }
+        next
+      }
+      /^P:/ {
+        name = pkgname($0)
+        if (name !~ /^python-/ || name ~ /^python3-/) {
+          print
+          next
+        }
+        prefix = $0
+        sub(/: .*/, ": ", prefix)
+        line = $0
+        sub(/^[^:]*:[^:]*: /, "", line)
+        n = split(line, a, " ")
+        out = ""
+        for (i = 1; i <= n; i++) {
+          if (a[i] in py3caps) {
+            if ((i + 2) <= n && a[i + 1] ~ /^[<=>]+$/) {
+              i += 2
+            }
+            continue
+          }
+          out = out (out == "" ? "" : " ") a[i]
+        }
+        print prefix out
+        next
+      }
+      { print }
+    ' "$CACHE_FILE" "$CACHE_FILE" > "$cache_file_py3"
+    mv "$cache_file_py3" "$CACHE_FILE"
+}
+
+# The rpmlist cache only contains packages that were already installed.  Dynamic
+# BuildRequires may need providers from repositories listed in osc buildinfo, so
+# add those repository metadata records to the temporary dependency cache.
+add_remote_buildinfo_repos_to_cache() {
+    local recipe="$1"
+    local srcdir="${recipe%/*}"
+    local repofile="$BUILD_INIT_CACHE/buildinfo.repos"
+    local apiurl=
+    local kind obsurl repo repotype baseurl cachedir
+
+    test "$srcdir" != "$recipe" || srcdir=.
+    test ! -s "$srcdir/.osc/_apiurl" || read -r apiurl < "$srcdir/.osc/_apiurl"
+
+    : > "$repofile"
+    if test -d "$srcdir/.osc" ; then
+        local arch="${BUILD_ARCH%%:*}"
+        local buildinfo_files=
+        local f
+
+        # Only use buildinfo files for the current target architecture.
+        # Example:
+        #   BUILD_ARCH=riscv64
+        #   .osc/_buildinfo-rv64-riscv64.xml       -> use
+        #   .osc/_buildinfo-x64-x86_64.xml         -> ignore
+        for f in "$srcdir"/.osc/_buildinfo-*-"$arch".xml ; do
+        test -e "$f" || continue
+        buildinfo_files="$buildinfo_files $f"
+        done
+
+        if test -n "$buildinfo_files" ; then
+        extract_buildinfo_repos "$apiurl" $buildinfo_files >> "$repofile"
+        else
+        # No current-arch buildinfo found. Do not fall back to all buildinfo
+        # files, because stale cross-arch buildinfo can pollute dependency
+        # expansion with unrelated repositories.
+        test -z "$LIST_STATE" && echo "no buildinfo for arch $arch found in $srcdir/.osc" >&2
+        fi
+    fi
+    if grep -q '^obs ' "$repofile" ; then
+	grep '^obs ' "$repofile" > "$repofile.obs"
+	mv "$repofile.obs" "$repofile"
+    fi
+    awk '!seen[$0]++' "$repofile" > "$repofile.unique"
+    mv "$repofile.unique" "$repofile"
+
+    test -s "$repofile" || return 0
+
+    test -z "$LIST_STATE" && echo "adding remote buildinfo repositories to $CACHE_FILE ..."
+    test -z "$REPOTYPE" && find_default_repotype
+    while read -r kind obsurl repo ; do
+	test -n "$repo" || continue
+	repotype=$REPOTYPE
+	# Keep queryobs/queryrepo on the current target architecture.  Repository
+	# names may contain strings such as x64 or rv64, but package metadata must be
+	# generated for BUILD_ARCH.
+	case $kind in
+	    obs)
+		set -- $BUILD_DIR/queryobs repo --cachedir="$CACHE_DIR" --obs "$obsurl" --arch "${BUILD_ARCH%%:*}" "$repo"
+		baseurl=$($BUILD_DIR/queryobs baseurl --arch "${BUILD_ARCH%%:*}" --obs "$obsurl" "$repo")
+		cachedir=$($BUILD_DIR/queryobs cachedir --cachedir="$CACHE_DIR" --arch "${BUILD_ARCH%%:*}" --obs "$obsurl" "$repo")
+		if test -n "$baseurl" -a -n "$cachedir" ; then
+		    repos_baseurl[${#repos_baseurl[@]}]="$baseurl"
+		    repos_cachedir[${#repos_cachedir[@]}]="$cachedir"
+		fi
+		;;
+	    url)
+		case $repo in
+		    arch@* | debian@* | hdlist2@* | rpmmd@* | rpm-md@* | suse@* | apk@*)
+			repotype="${repo%%@*}"
+			repo="${repo#*@}"
+			;;
+		esac
+		repo=$(normalize_remote_repo_url "$repo")
+		set -- $BUILD_DIR/queryrepo --cachedir="$CACHE_DIR" --arch "${BUILD_ARCH%%:*}" --type "$repotype" "$repo" intrepo
+		baseurl=$($BUILD_DIR/queryrepo --arch "${BUILD_ARCH%%:*}" --type "$repotype" "$repo" baseurl)
+		cachedir=$($BUILD_DIR/queryrepo --cachedir="$CACHE_DIR" --arch "${BUILD_ARCH%%:*}" --type "$repotype" "$repo" cachedir)
+		if test -n "$baseurl" -a -n "$cachedir" ; then
+		    repos_baseurl[${#repos_baseurl[@]}]="$baseurl"
+		    repos_cachedir[${#repos_cachedir[@]}]="$cachedir"
+		fi
+		;;
+	esac
+	echo "$@" >&2
+	"$@" || cleanup_and_exit 1
+	echo D:
+    done < "$repofile" >> "$CACHE_FILE"
+
+    rm -f "$repofile"
+}
+
+# buildinfo URL paths usually point at the repository root without the target
+# architecture suffix.  Normalize them to the concrete arch directory that
+# queryrepo expects.
+normalize_remote_repo_url() {
+    local repo="$1"
+    local arch="${BUILD_ARCH%%:*}"
+
+    repo="${repo%/}/"
+    if test -n "$arch" -a "$repo" = "${repo%/$arch/}/$arch/" ; then
+	echo "$repo"
+    else
+	echo "$repo$arch/"
+    fi
+}
+
+# Extract only repository references from osc buildinfo XML.  The caller is
+# responsible for selecting the current-architecture buildinfo file before this
+# parser runs.
+extract_buildinfo_repos() {
+    local apiurl="$1"
+    shift
+
+    awk -v apiurl="$apiurl" '
+      /<buildinfo[[:space:]][^>]*downloadurl="/ {
+        downloadurl = $0
+        sub(/.*downloadurl="/, "", downloadurl)
+        sub(/".*/, "", downloadurl)
+        gsub(/&amp;/, "\\&", downloadurl)
+      }
+      /<path[[:space:]][^>]*project="[^"]+"[[:space:]][^>]*repository="[^"]+"/ {
+        line = $0
+        project = line
+        repository = line
+        sub(/.*project="/, "", project)
+        sub(/".*/, "", project)
+        sub(/.*repository="/, "", repository)
+        sub(/".*/, "", repository)
+        gsub(/&amp;/, "\\&", project)
+        gsub(/&amp;/, "\\&", repository)
+        if (apiurl != "") {
+          repo = "obs:/" project "/" repository
+          key = "obs " apiurl " " repo
+          if (!seen[key]++) {
+            print key
+          }
+        }
+      }
+      /<path[[:space:]][^>]*url="/ {
+        line = $0
+        sub(/.*url="/, "", line)
+        sub(/".*/, "", line)
+        gsub(/&amp;/, "\\&", line)
+        key = "url - " line
+        if (!seen[key]++) {
+          print key
+        }
+      }
+    ' "$@" 2>/dev/null
+}
+
+# Build a small dependency cache from the packages already listed in RPMLIST.
+# Do not scan the original package cache directories: they can contain an entire
+# repository and may make createdirdeps consume excessive memory.
+create_cache_file_from_rpmlist() {
+    local pkgsfile="$BUILD_INIT_CACHE/rpmlist.pkgs"
+    local pkgdir="$BUILD_INIT_CACHE/rpmlist.pkgdir"
+    local pkg src rest base link n
+
+    : > "$pkgsfile"
+    rm -rf "$pkgdir"
+    mkdir -p "$pkgdir" || cleanup_and_exit 1 "could not create $pkgdir"
+
+    while read -r pkg src rest ; do
+	case "$pkg" in
+	    preinstall:|vminstall:|runscripts:|dist:|installonly:|noinstall:|rpmid:|preinstallimage:|preinstallimagesource:|preinstallimageinfo:)
+		continue
+		;;
+	    sysroot:)
+		src=${rest%%[ 	]*}
+		;;
+	esac
+	case "$src" in
+	    /*.rpm|/*.deb|/*.arch|/*.pkg.tar.gz|/*.pkg.tar.xz|/*.pkg.tar.zst)
+		test -e "$src" && echo "$src"
+		;;
+	esac
+    done < "$RPMLIST" | sort -u > "$pkgsfile"
+
+    if test ! -s "$pkgsfile" ; then
+	rm -rf "$pkgdir" "$pkgsfile"
+	create_cache_file
+	return
+    fi
+
+    test -z "$LIST_STATE" && echo "initializing $CACHE_FILE from rpmlist packages ..."
+
+    n=0
+    while IFS= read -r src ; do
+	n=$((n + 1))
+	base=${src##*/}
+	link="$pkgdir/$n-$base"
+
+	# Prefer hardlinks to avoid copying packages. Fall back to symlinks
+	# for cross-filesystem cache directories.
+	ln "$src" "$link" 2>/dev/null || ln -s "$src" "$link" || cleanup_and_exit 1 "could not link $src into $pkgdir"
+    done < "$pkgsfile"
+
+    {
+	set -- "$BUILD_DIR/createdirdeps" --oldfile "$CACHE_FILE" "$pkgdir"
+	echo "$@" >&2
+	"$@" || cleanup_and_exit 1
+	echo D:
+    } > "$CACHE_FILE.new"
+
+    mv "$CACHE_FILE.new" "$CACHE_FILE"
+    rm -rf "$pkgdir" "$pkgsfile"
 }
 
 setup_repos_baseurl_cachedir() {
@@ -697,6 +1045,8 @@ else
 	    rm -f $BUILD_IS_RUNNING
 	    cleanup_and_exit 1
 	fi
+    else
+	merge_dynamic_buildrequires_into_rpmlist "${PKGS[@]}"
     fi
 
     if test -n "$LIST_STATE" ; then

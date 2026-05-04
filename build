@@ -1967,8 +1967,14 @@ for RECIPEPATH in "${RECIPEFILES[@]}" ; do
     GEN_BUILDREQS_PACKS=()
     recipe_build
 
-    if test "$BUILD_SUCCEEDED" = genbuildreqs -a "$DO_INIT" = true -a -z "$RPMLIST" -a -z "$RUNNING_IN_VM" -a -n "${GEN_BUILDREQS_PACKS[*]}" ; then
-	# re-expand deps with GEN_BUILDREQS_PACKS extra packages
+    GEN_BUILDREQS_PASSES=0
+    test -n "$GEN_BUILDREQS_MAX_PASSES" || GEN_BUILDREQS_MAX_PASSES=20
+    while test "$BUILD_SUCCEEDED" = genbuildreqs -a "$DO_INIT" = true -a -z "$RUNNING_IN_VM" -a -n "${GEN_BUILDREQS_PACKS[*]}" ; do
+	if test "$GEN_BUILDREQS_PASSES" -ge "$GEN_BUILDREQS_MAX_PASSES" ; then
+	    cleanup_and_exit 9 "too many dynamic build dependency passes"
+	fi
+	GEN_BUILDREQS_PASSES=$((GEN_BUILDREQS_PASSES + 1))
+	echo "re-expanding dynamic build dependencies, pass $GEN_BUILDREQS_PASSES ..."
 	umount_stuff
 	set -- init_buildsystem --configdir "$CONFIG_DIR" --cachedir "$CACHE_DIR" "${initbuildsysstuff[@]}" "${definesnstuff[@]}" "${repos[@]}" $DLNOSIGNATURE $USEUSEDFORBUILD $CREATE_BUILD_BINARIES $RPMLIST "$MYSRCDIR/$RECIPEFILE" $ADDITIONAL_PACKS "${GEN_BUILDREQS_PACKS[@]}"
 	echo "$* ..."
@@ -1977,7 +1983,7 @@ for RECIPEPATH in "${RECIPEFILES[@]}" ; do
 	mount_stuff
 	BUILD_SUCCEEDED=false
 	recipe_build
-    fi
+    done
 
     if test "$BUILD_SUCCEEDED" = genbuildreqs ; then
 	recipe_cleanup
