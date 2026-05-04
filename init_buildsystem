@@ -555,6 +555,296 @@ downloadpkg() {
     mv "$destfile" "$SRC" || cleanup_and_exit 1
 }
 
+merge_dynamic_buildrequires_into_rpmlist() {
+    local recipe="$1"
+    shift
+
+    test -n "$RPMLIST" || return 0
+    test -n "$recipe" || return 0
+    test "$recipe" != "${recipe%.spec}" || return 0
+    test "$recipe" = "${recipe#--}" || return 0
+    test "$#" != 0 || return 0
+
+    CACHE_FILE=$BUILD_ROOT/.srcfiles.cache
+    create_cache_file_from_rpmlist
+    add_remote_buildinfo_repos_to_cache "$recipe"
+    prefer_python3_dist_providers
+
+    local rpmlist_dynamic="$BUILD_INIT_CACHE/rpmlist.dynamic"
+    local rpmlist_context="$BUILD_INIT_CACHE/rpmlist.context"
+    test -z "$LIST_STATE" && echo "expanding dynamic build dependencies..."
+    awk '$1 !~ /^(preinstall:|vminstall:|runscripts:|dist:|installonly:|noinstall:|rpmid:|preinstallimage:|preinstallimagesource:|preinstallimageinfo:|sysroot:)$/ { print $1 }' "$RPMLIST" > "$rpmlist_context"
+    VMOPT=
+    test -z "$PREPARE_VM" || VMOPT=--vm
+    if ! $BUILD_DIR/expanddeps $USEUSEDFORBUILD $VMOPT "${definesnstuff[@]}" --dist "$BUILD_DIST" --depfile "$CACHE_FILE" --archpath "$BUILD_ARCH" --configdir $CONFIG_DIR $(cat "$rpmlist_context") "$@" > "$rpmlist_dynamic" ; then
+	rm -f $BUILD_IS_RUNNING
+	rm -f "$rpmlist_context"
+	cleanup_and_exit 1
+    fi
+
+    awk '
+      FNR == NR {
+        if ($1 == "rpmid:") {
+          idpkg = $2
+          sub(/:.*/, "", idpkg)
+          dynids[idpkg] = $0
+        } else if ($1 !~ /^(preinstall:|vminstall:|runscripts:|dist:|installonly:|noinstall:)$/) {
+          dynpkgs[$1] = $0
+          dynorder[++dyncount] = $1
+        } else {
+        }
+        next
+      }
+      {
+        if ($1 == "rpmid:") {
+          idpkg = $2
+          sub(/:.*/, "", idpkg)
+          if (idpkg in dynids) {
+            print dynids[idpkg]
+            delete dynids[idpkg]
+          } else {
+            print
+          }
+        } else if ($1 ~ /^(preinstall:|vminstall:|runscripts:|dist:|installonly:|noinstall:)$/) {
+          print
+        } else {
+          print
+          seen[$1] = 1
+          delete dynpkgs[$1]
+        }
+      }
+      END {
+        for (i = 1; i <= dyncount; i++) {
+          pkg = dynorder[i]
+          if ((pkg in dynpkgs) && !(pkg in seen)) {
+            print dynpkgs[pkg]
+            if (pkg in dynids) {
+              print dynids[pkg]
+              delete dynids[pkg]
+            }
+          }
+        }
+      }
+    ' "$rpmlist_dynamic" "$RPMLIST" > "$BUILD_INIT_CACHE/rpmlist.merged"
+    mv "$BUILD_INIT_CACHE/rpmlist.merged" "$RPMLIST"
+    rm -f "$rpmlist_dynamic" "$rpmlist_context"
+}
+
+prefer_python3_dist_providers() {
+    local cache_file_py3="$BUILD_INIT_CACHE/srcfiles.cache.py3"
+
+    awk '
+      function pkgname(line, name) {
+        name = line
+        sub(/^[A-Za-z]:/, "", name)
+        sub(/\..*/, "", name)
+        return name
+      }
+      function record_py3_caps(line, name, n, i, a, cap) {
+        name = pkgname(line)
+        if (name !~ /^python3-/) {
+          return
+        }
+        sub(/^[^:]*:[^:]*: /, "", line)
+        n = split(line, a, " ")
+        for (i = 1; i <= n; i++) {
+          cap = a[i]
+          if (cap ~ /^python3(\.[0-9]+)?dist\(/) {
+            py3caps[cap] = 1
+          }
+        }
+      }
+      FNR == NR {
+        if ($0 ~ /^P:/) {
+          record_py3_caps($0)
+        }
+        next
+      }
+      /^P:/ {
+        name = pkgname($0)
+        if (name !~ /^python-/ || name ~ /^python3-/) {
+          print
+          next
+        }
+        prefix = $0
+        sub(/: .*/, ": ", prefix)
+        line = $0
+        sub(/^[^:]*:[^:]*: /, "", line)
+        n = split(line, a, " ")
+        out = ""
+        for (i = 1; i <= n; i++) {
+          if (a[i] in py3caps) {
+            if ((i + 2) <= n && a[i + 1] ~ /^[<=>]+$/) {
+              i += 2
+            }
+            continue
+          }
+          out = out (out == "" ? "" : " ") a[i]
+        }
+        print prefix out
+        next
+      }
+      { print }
+    ' "$CACHE_FILE" "$CACHE_FILE" > "$cache_file_py3"
+    mv "$cache_file_py3" "$CACHE_FILE"
+}
+
+add_remote_buildinfo_repos_to_cache() {
+    local recipe="$1"
+    local srcdir="${recipe%/*}"
+    local repofile="$BUILD_INIT_CACHE/buildinfo.repos"
+    local apiurl=
+    local kind obsurl repo repotype baseurl cachedir
+
+    test "$srcdir" != "$recipe" || srcdir=.
+    test ! -s "$srcdir/.osc/_apiurl" || read -r apiurl < "$srcdir/.osc/_apiurl"
+
+    : > "$repofile"
+    if test -d "$srcdir/.osc" ; then
+	extract_buildinfo_repos "$apiurl" "$srcdir"/.osc/_buildinfo-*.xml >> "$repofile"
+    fi
+    if grep -q '^obs ' "$repofile" ; then
+	grep '^obs ' "$repofile" > "$repofile.obs"
+	mv "$repofile.obs" "$repofile"
+    fi
+    awk '!seen[$0]++' "$repofile" > "$repofile.unique"
+    mv "$repofile.unique" "$repofile"
+
+    test -s "$repofile" || return 0
+
+    test -z "$LIST_STATE" && echo "adding remote buildinfo repositories to $CACHE_FILE ..."
+    test -z "$REPOTYPE" && find_default_repotype
+    while read -r kind obsurl repo ; do
+	test -n "$repo" || continue
+	repotype=$REPOTYPE
+	case $kind in
+	    obs)
+		set -- $BUILD_DIR/queryobs repo --cachedir="$CACHE_DIR" --obs "$obsurl" --arch "${BUILD_ARCH%%:*}" "$repo"
+		baseurl=$($BUILD_DIR/queryobs baseurl --arch "${BUILD_ARCH%%:*}" --obs "$obsurl" "$repo")
+		cachedir=$($BUILD_DIR/queryobs cachedir --cachedir="$CACHE_DIR" --arch "${BUILD_ARCH%%:*}" --obs "$obsurl" "$repo")
+		if test -n "$baseurl" -a -n "$cachedir" ; then
+		    repos_baseurl[${#repos_baseurl[@]}]="$baseurl"
+		    repos_cachedir[${#repos_cachedir[@]}]="$cachedir"
+		fi
+		;;
+	    url)
+		case $repo in
+		    arch@* | debian@* | hdlist2@* | rpmmd@* | rpm-md@* | suse@* | apk@*)
+			repotype="${repo%%@*}"
+			repo="${repo#*@}"
+			;;
+		esac
+		repo=$(normalize_remote_repo_url "$repo")
+		set -- $BUILD_DIR/queryrepo --cachedir="$CACHE_DIR" --arch "${BUILD_ARCH%%:*}" --type "$repotype" "$repo" intrepo
+		baseurl=$($BUILD_DIR/queryrepo --arch "${BUILD_ARCH%%:*}" --type "$repotype" "$repo" baseurl)
+		cachedir=$($BUILD_DIR/queryrepo --cachedir="$CACHE_DIR" --arch "${BUILD_ARCH%%:*}" --type "$repotype" "$repo" cachedir)
+		if test -n "$baseurl" -a -n "$cachedir" ; then
+		    repos_baseurl[${#repos_baseurl[@]}]="$baseurl"
+		    repos_cachedir[${#repos_cachedir[@]}]="$cachedir"
+		fi
+		;;
+	esac
+	echo "$@" >&2
+	"$@" || cleanup_and_exit 1
+	echo D:
+    done < "$repofile" >> "$CACHE_FILE"
+
+    rm -f "$repofile"
+}
+
+normalize_remote_repo_url() {
+    local repo="$1"
+    local arch="${BUILD_ARCH%%:*}"
+
+    repo="${repo%/}/"
+    if test -n "$arch" -a "$repo" = "${repo%/$arch/}/$arch/" ; then
+	echo "$repo"
+    else
+	echo "$repo$arch/"
+    fi
+}
+
+extract_buildinfo_repos() {
+    local apiurl="$1"
+    shift
+
+    awk -v apiurl="$apiurl" '
+      /<buildinfo[[:space:]][^>]*downloadurl="/ {
+        downloadurl = $0
+        sub(/.*downloadurl="/, "", downloadurl)
+        sub(/".*/, "", downloadurl)
+        gsub(/&amp;/, "\\&", downloadurl)
+      }
+      /<path[[:space:]][^>]*project="[^"]+"[[:space:]][^>]*repository="[^"]+"/ {
+        line = $0
+        project = line
+        repository = line
+        sub(/.*project="/, "", project)
+        sub(/".*/, "", project)
+        sub(/.*repository="/, "", repository)
+        sub(/".*/, "", repository)
+        gsub(/&amp;/, "\\&", project)
+        gsub(/&amp;/, "\\&", repository)
+        if (apiurl != "") {
+          repo = "obs:/" project "/" repository
+          key = "obs " apiurl " " repo
+          if (!seen[key]++) {
+            print key
+          }
+        }
+      }
+      /<path[[:space:]][^>]*url="/ {
+        line = $0
+        sub(/.*url="/, "", line)
+        sub(/".*/, "", line)
+        gsub(/&amp;/, "\\&", line)
+        key = "url - " line
+        if (!seen[key]++) {
+          print key
+        }
+      }
+    ' "$@" 2>/dev/null
+}
+
+create_cache_file_from_rpmlist() {
+    local dirsfile="$BUILD_INIT_CACHE/rpmlist.dirs"
+    local src dir
+
+    : > "$dirsfile"
+    while read -r pkg src rest ; do
+	case "$pkg" in
+	    preinstall:|vminstall:|runscripts:|dist:|installonly:|noinstall:|rpmid:|preinstallimage:|preinstallimagesource:|preinstallimageinfo:)
+		continue
+		;;
+	    sysroot:)
+		src=${rest%%[ 	]*}
+		;;
+	esac
+	case "$src" in
+	    /*.rpm|/*.deb|/*.pkg.tar.gz|/*.pkg.tar.xz|/*.pkg.tar.zst)
+		dir=${src%/*}
+		echo "$dir"
+		;;
+	esac
+    done < "$RPMLIST" | sort -u > "$dirsfile"
+
+    if test ! -s "$dirsfile" ; then
+	create_cache_file
+	return
+    fi
+
+    test -z "$LIST_STATE" && echo "initializing $CACHE_FILE from rpmlist package cache ..."
+    while read -r dir ; do
+	set -- $BUILD_DIR/createdirdeps --oldfile "$CACHE_FILE" "$dir"
+	echo "$@" >&2
+	"$@" || cleanup_and_exit 1
+	echo D:
+    done < "$dirsfile" > "$CACHE_FILE.new"
+
+    mv "$CACHE_FILE.new" "$CACHE_FILE"
+    rm -f "$dirsfile"
+}
+
 setup_repos_baseurl_cachedir() {
     repos_baseurl=()
     repos_cachedir=()
@@ -697,6 +987,8 @@ else
 	    rm -f $BUILD_IS_RUNNING
 	    cleanup_and_exit 1
 	fi
+    else
+	merge_dynamic_buildrequires_into_rpmlist "${PKGS[@]}"
     fi
 
     if test -n "$LIST_STATE" ; then

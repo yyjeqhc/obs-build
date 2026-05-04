@@ -215,8 +215,27 @@ while(<F>) {
 }
 close F;
 
+sub count_versioned_crate_provides_raw {
+  my ($deps) = @_;
+  return 0 unless defined $deps;
+  my $cnt = 0;
+  while ($deps =~ /(?:^|\s)crate\([^\/\)]+\)\s*=/g) {
+    $cnt++;
+  }
+  return $cnt;
+}
+
 for my $arch (@archs) {
-  $packs{$_} ||= "$_.$arch" for @{$packs_arch{$arch} || []};
+  for my $pack (@{$packs_arch{$arch} || []}) {
+    my $candidate = "$pack.$arch";
+    if (!$packs{$pack}) {
+      $packs{$pack} = $candidate;
+      next;
+    }
+    if ($arch eq $noarch && count_versioned_crate_provides_raw($prov{$candidate}) > count_versioned_crate_provides_raw($prov{$packs{$pack}})) {
+      $packs{$pack} = $candidate;
+    }
+  }
 }
 
 # XXX: move to separate tool
