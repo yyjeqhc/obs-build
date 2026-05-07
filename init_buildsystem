@@ -777,6 +777,9 @@ fetch_repo_via_osc() {
     # 检查 osc 命令是否可用
     command -v osc >/dev/null 2>&1 || return 1
 
+    # 确保 obsurl 以 / 结尾
+    obsurl="${obsurl%/}/"
+
     # 构建 osc 选项
     apiurl="$obsurl"
     osc_opts=""
@@ -853,6 +856,7 @@ add_remote_buildinfo_repos_to_cache() {
 	case $kind in
 	    obs)
 		local prp="${repo#obs:/}"
+		prp="${prp#/}"  # 去掉开头的 /
 		local arch="${BUILD_ARCH%%:*}"
 
 		# 优先使用 osc api 获取仓库元数据
