@@ -689,6 +689,66 @@ prefer_python3_dist_providers() {
     mv "$cache_file_py3" "$CACHE_FILE"
 }
 
+get_buildinfo_from_osc() {
+    local srcdir="$1"
+    local repofile="$2"
+    local apiurl="$3"
+    local project package arch buildinfo_xml osc_opts repo arch_pair
+
+    # 读取 project 和 package 信息
+    test ! -s "$srcdir/.osc/_project" || read -r project < "$srcdir/.osc/_project"
+    test ! -s "$srcdir/.osc/_package" || read -r package < "$srcdir/.osc/_package"
+
+    # 如果缺少必要信息，返回失败
+    test -n "$project" && test -n "$package" || return 1
+
+    # 检查 osc 命令是否可用
+    command -v osc >/dev/null 2>&1 || return 1
+
+    # 构建 osc 选项
+    osc_opts=""
+    if test -n "$apiurl" ; then
+	osc_opts="-A $apiurl"
+    fi
+
+    # 获取架构信息
+    arch="${BUILD_ARCH%%:*}"
+    test -n "$arch" || arch=$(uname -m)
+
+    # 优先使用 _build_repositories 文件获取仓库信息
+    if test -s "$srcdir/.osc/_build_repositories" ; then
+	while read -r repo arch_pair rest ; do
+	    test -n "$repo" || continue
+	    # 只使用与目标架构匹配的仓库
+	    if test -n "$arch_pair" -a "$arch_pair" != "$arch" ; then
+		continue
+	    fi
+	    buildinfo_xml="$BUILD_INIT_CACHE/buildinfo.osc.xml"
+	    if (cd "$srcdir" && osc $osc_opts buildinfo "$project" "$package" "$repo" "$arch" > "$buildinfo_xml" 2>/dev/null); then
+		if test -s "$buildinfo_xml" ; then
+		    extract_buildinfo_repos "$apiurl" "$buildinfo_xml" >> "$repofile"
+		    rm -f "$buildinfo_xml"
+		    return 0
+		fi
+	    fi
+	    rm -f "$buildinfo_xml"
+	done < "$srcdir/.osc/_build_repositories"
+    else
+	# 没有 _build_repositories 文件，直接使用 BUILD_ARCH
+	buildinfo_xml="$BUILD_INIT_CACHE/buildinfo.osc.xml"
+	if (cd "$srcdir" && osc $osc_opts buildinfo "$project" "$package" "$arch" > "$buildinfo_xml" 2>/dev/null); then
+	    if test -s "$buildinfo_xml" ; then
+		extract_buildinfo_repos "$apiurl" "$buildinfo_xml" >> "$repofile"
+		rm -f "$buildinfo_xml"
+		return 0
+	    fi
+	fi
+	rm -f "$buildinfo_xml"
+    fi
+
+    return 1
+}
+
 add_remote_buildinfo_repos_to_cache() {
     local recipe="$1"
     local srcdir="${recipe%/*}"
@@ -701,7 +761,11 @@ add_remote_buildinfo_repos_to_cache() {
 
     : > "$repofile"
     if test -d "$srcdir/.osc" ; then
-	extract_buildinfo_repos "$apiurl" "$srcdir"/.osc/_buildinfo-*.xml >> "$repofile"
+	# 优先使用 osc 命令获取 buildinfo
+	if ! get_buildinfo_from_osc "$srcdir" "$repofile" "$apiurl" ; then
+	    # 回退到读取现有的 _buildinfo-*.xml 文件
+	    extract_buildinfo_repos "$apiurl" "$srcdir"/.osc/_buildinfo-*.xml >> "$repofile"
+	fi
     fi
     if grep -q '^obs ' "$repofile" ; then
 	grep '^obs ' "$repofile" > "$repofile.obs"
