@@ -523,7 +523,7 @@ fail_exit() {
 downloadpkg() {
     local url="$1"
 
-    case $url in 
+    case $url in
 	zypp://* | http://* | https://* | ftp://* | ftps://*) ;;
 	*) cleanup_and_exit 1 "Invalid url: $url" ;;
     esac
@@ -536,7 +536,25 @@ downloadpkg() {
     local destdir="$cachedir/tmp"
     mkdir -p "$destdir"
     echo "downloading $url ... ";
-    $BUILD_DIR/download "$destdir" "$url" || cleanup_and_exit 1
+
+    # 优先使用 osc api 下载（支持认证）
+    local downloaded_via_osc=0
+    if command -v osc >/dev/null 2>&1 ; then
+	local destfile="$destdir/${url##*/}"
+	if osc api "$url" > "$destfile" 2>/dev/null ; then
+	    if test -s "$destfile" ; then
+		downloaded_via_osc=1
+	    else
+		rm -f "$destfile"
+	    fi
+	fi
+    fi
+
+    # 如果 osc 下载失败，回退到使用 download 脚本
+    if test "$downloaded_via_osc" = 0 ; then
+	$BUILD_DIR/download "$destdir" "$url" || cleanup_and_exit 1
+    fi
+
     local destfile="$destdir/${url##*/}"
     if test ! -e "$destfile" ; then
 	cleanup_and_exit 1 "expected $destfile after download but it's missing"
@@ -780,9 +798,13 @@ fetch_repo_via_osc() {
 
     if osc $osc_opts api "$requrl" > "$cpio_file" 2>/dev/null ; then
 	if test -s "$cpio_file" ; then
-	    # 解析 cpio 文件
+	    # 解析 cpio 文件，提取 repositorycache 并重命名为 repository.data
 	    local data_file="$cache_path/repository.data"
 	    (cd "$cache_path" && cpio -idm < repository.cpio 2>/dev/null)
+	    # 如果提取成功，将 repositorycache 重命名为 repository.data
+	    if test -f "$cache_path/repositorycache" ; then
+		mv "$cache_path/repositorycache" "$data_file"
+	    fi
 	    if test -s "$data_file" ; then
 		# 返回缓存目录路径
 		echo "$cache_path"
