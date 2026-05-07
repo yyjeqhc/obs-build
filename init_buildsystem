@@ -749,6 +749,53 @@ get_buildinfo_from_osc() {
     return 1
 }
 
+fetch_repo_via_osc() {
+    local obsurl="$1"
+    local prp="$2"
+    local arch="$3"
+    local cachedir="$4"
+    local osc_opts apiurl project repository cache_path
+
+    # 检查 osc 命令是否可用
+    command -v osc >/dev/null 2>&1 || return 1
+
+    # 构建 osc 选项
+    apiurl="$obsurl"
+    osc_opts=""
+    if test -n "$apiurl" ; then
+	osc_opts="-A $apiurl"
+    fi
+
+    # 解析 project/repository
+    project="${prp%%/*}"
+    repository="${prp#*/}"
+
+    # 使用 osc 的缓存目录结构：project/repository/arch
+    cache_path="$cachedir/$project/$repository/$arch"
+    mkdir -p "$cache_path"
+
+    # 使用 osc api 下载仓库元数据
+    local requrl="${obsurl}build/$prp/$arch/_repository?view=cache"
+    local cpio_file="$cache_path/repository.cpio"
+
+    if osc $osc_opts api "$requrl" > "$cpio_file" 2>/dev/null ; then
+	if test -s "$cpio_file" ; then
+	    # 解析 cpio 文件
+	    local data_file="$cache_path/repository.data"
+	    (cd "$cache_path" && cpio -idm < repository.cpio 2>/dev/null)
+	    if test -s "$data_file" ; then
+		# 返回缓存目录路径
+		echo "$cache_path"
+		return 0
+	    fi
+	fi
+    fi
+
+    # 清理失败的文件
+    rm -rf "$cache_path"
+    return 1
+}
+
 add_remote_buildinfo_repos_to_cache() {
     local recipe="$1"
     local srcdir="${recipe%/*}"
@@ -783,9 +830,26 @@ add_remote_buildinfo_repos_to_cache() {
 	repotype=$REPOTYPE
 	case $kind in
 	    obs)
-		set -- $BUILD_DIR/queryobs repo --cachedir="$CACHE_DIR" --obs "$obsurl" --arch "${BUILD_ARCH%%:*}" "$repo"
-		baseurl=$($BUILD_DIR/queryobs baseurl --arch "${BUILD_ARCH%%:*}" --obs "$obsurl" "$repo")
-		cachedir=$($BUILD_DIR/queryobs cachedir --cachedir="$CACHE_DIR" --arch "${BUILD_ARCH%%:*}" --obs "$obsurl" "$repo")
+		local prp="${repo#obs:/}"
+		local arch="${BUILD_ARCH%%:*}"
+
+		# 优先使用 osc api 获取仓库元数据
+		if test -n "$apiurl" ; then
+		    cachedir=$(fetch_repo_via_osc "$obsurl" "$prp" "$arch" "$CACHE_DIR")
+		    if test -n "$cachedir" ; then
+			baseurl="${obsurl}build/$prp/$arch/"
+			repos_baseurl[${#repos_baseurl[@]}]="$baseurl"
+			repos_cachedir[${#repos_cachedir[@]}]="$cachedir"
+			echo "osc repo --obs $obsurl --arch $arch $repo" >&2
+			echo D:
+			continue
+		    fi
+		fi
+
+		# 回退到使用 queryobs
+		set -- $BUILD_DIR/queryobs repo --cachedir="$CACHE_DIR" --obs "$obsurl" --arch "$arch" "$repo"
+		baseurl=$($BUILD_DIR/queryobs baseurl --arch "$arch" --obs "$obsurl" "$repo")
+		cachedir=$($BUILD_DIR/queryobs cachedir --cachedir="$CACHE_DIR" --arch "$arch" --obs "$obsurl" "$repo")
 		if test -n "$baseurl" -a -n "$cachedir" ; then
 		    repos_baseurl[${#repos_baseurl[@]}]="$baseurl"
 		    repos_cachedir[${#repos_cachedir[@]}]="$cachedir"

@@ -128,6 +128,32 @@ sub create_ua {
 }
 
 #
+# check if a command is available
+#
+sub command_available {
+  my ($cmd) = @_;
+  return system("command -v $cmd >/dev/null 2>&1") == 0;
+}
+
+#
+# download data using osc api command
+#
+sub download_via_osc {
+  my ($url, $dest, $opts) = @_;
+  my $apiurl = $opts->{'obs'} || '';
+  my $osc_opts = '';
+  $osc_opts = "-A $apiurl" if $apiurl;
+
+  # 检查 osc 命令是否可用
+  return 0 unless command_available('osc');
+
+  # 使用 osc api 下载数据
+  my $cmd = "osc $osc_opts api '$url' > '$dest' 2>/dev/null";
+  my $ret = system($cmd);
+  return $ret == 0 && -s $dest;
+}
+
+#
 # get the project data from an OBS project
 #
 sub fetch_proj {
@@ -351,8 +377,25 @@ sub fetch_repodata {
   $baseurl .= '/' unless $baseurl =~ /\/$/;
   my $requrl .= "${baseurl}build/$prp/$arch/_repository?view=cache";
   $requrl .= "&module=".PBuild::Util::urlencode($_, 1) for @{$modules || []};
-  my $ua = create_ua();
-  Build::Download::download($requrl, "$tmpdir/repository.cpio", undef, 'ua' => $ua, 'retry' => 3);
+
+  # 尝试使用 osc 命令下载（支持认证）
+  my $downloaded_via_osc = 0;
+  if (command_available('osc')) {
+    my $apiurl = $opts->{'obs'} || '';
+    my $osc_opts = '';
+    $osc_opts = "-A $apiurl" if $apiurl;
+    my $cmd = "osc $osc_opts api '$requrl' > '$tmpdir/repository.cpio' 2>/dev/null";
+    if (system($cmd) == 0 && -s "$tmpdir/repository.cpio") {
+      $downloaded_via_osc = 1;
+    }
+  }
+
+  # 如果 osc 下载失败，回退到使用 Build::Download
+  unless ($downloaded_via_osc) {
+    my $ua = create_ua();
+    Build::Download::download($requrl, "$tmpdir/repository.cpio", undef, 'ua' => $ua, 'retry' => 3);
+  }
+
   unlink("$tmpdir/repository.data");
   PBuild::Cpio::cpio_extract("$tmpdir/repository.cpio", "$tmpdir/repository.data", 'extract' => 'repositorycache', 'missingok' => 1);
   my $rdata;
